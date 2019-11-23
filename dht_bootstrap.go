@@ -2,20 +2,20 @@ package dht
 
 import (
 	"context"
-	"fmt"
-	"strings"
-	"sync"
 	"time"
 
+	process "github.com/jbenet/goprocess"
+	processctx "github.com/jbenet/goprocess/context"
 	"github.com/libp2p/go-libp2p-core/routing"
 	"github.com/multiformats/go-multiaddr"
 	_ "github.com/multiformats/go-multiaddr-dns"
-	"github.com/pkg/errors"
 )
 
 var DefaultBootstrapPeers []multiaddr.Multiaddr
 
-var minRTBootstrapThreshold = 4
+// Minimum number of peers in the routing table. If we drop below this and we
+// see a new peer, we trigger a bootstrap round.
+var minRTRefreshThreshold = 4
 
 func init() {
 	for _, s := range []string{
@@ -41,66 +41,53 @@ func init() {
 	}
 }
 
-// BootstrapConfig runs cfg.Queries bootstrap queries every cfg.BucketPeriod.
-func (dht *IpfsDHT) Bootstrap(ctx context.Context) error {
-	triggerBootstrapFnc := func() {
-		logger.Infof("triggerBootstrapFnc: RT only has %d peers which is less than the min threshold of %d, triggering self & bucket bootstrap",
-			dht.routingTable.Size(), minRTBootstrapThreshold)
-
-		if err := dht.selfWalk(ctx); err != nil {
-			logger.Warningf("triggerBootstrapFnc: self walk: error: %s", err)
-		}
-
-		if err := dht.bootstrapBuckets(ctx); err != nil {
-			logger.Warningf("triggerBootstrapFnc: bootstrap buckets: error bootstrapping: %s", err)
-		}
-	}
-
-	// we should query for self periodically so we can discover closer peers
-	go func() {
-		for {
-			err := dht.selfWalk(ctx)
-			if err != nil {
-				logger.Warningf("self walk: error: %s", err)
-			}
-			select {
-			case <-time.After(dht.bootstrapCfg.SelfQueryInterval):
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
+// Start the refresh worker.
+func (dht *IpfsDHT) startRefreshing() error {
 	// scan the RT table periodically & do a random walk on k-buckets that haven't been queried since the given bucket period
-	go func() {
+	dht.proc.Go(func(proc process.Process) {
+		ctx := processctx.OnClosingContext(proc)
+
+		refreshTicker := time.NewTicker(dht.rtRefreshPeriod)
+		defer refreshTicker.Stop()
+
+		// refresh if option is set
+		if dht.autoRefresh {
+			dht.doRefresh(ctx)
+		} else {
+			// disable the "auto-refresh" ticker so that no more ticks are sent to this channel
+			refreshTicker.Stop()
+		}
+
 		for {
-			err := dht.bootstrapBuckets(ctx)
-			if err != nil {
-				logger.Warningf("bootstrap buckets: error bootstrapping: %s", err)
-			}
 			select {
-			case <-time.After(dht.bootstrapCfg.RoutingTableScanInterval):
-			case <-dht.triggerBootstrap:
-				triggerBootstrapFnc()
+			case <-refreshTicker.C:
+			case <-dht.triggerRtRefresh:
+				logger.Infof("triggering a refresh: RT has %d peers", dht.routingTable.Size())
 			case <-ctx.Done():
 				return
 			}
+			dht.doRefresh(ctx)
 		}
-	}()
+	})
 
 	return nil
 }
 
-// bootstrapBuckets scans the routing table, and does a random walk on k-buckets that haven't been queried since the given bucket period
-func (dht *IpfsDHT) bootstrapBuckets(ctx context.Context) error {
+func (dht *IpfsDHT) doRefresh(ctx context.Context) {
+	dht.selfWalk(ctx)
+	dht.refreshBuckets(ctx)
+}
+
+// refreshBuckets scans the routing table, and does a random walk on k-buckets that haven't been queried since the given bucket period
+func (dht *IpfsDHT) refreshBuckets(ctx context.Context) {
 	doQuery := func(bucketId int, target string, f func(context.Context) error) error {
-		logger.Infof("starting bootstrap query for bucket %d to %s (routing table size was %d)",
+		logger.Infof("starting refreshing bucket %d to %s (routing table size was %d)",
 			bucketId, target, dht.routingTable.Size())
 		defer func() {
-			logger.Infof("finished bootstrap query for bucket %d to %s (routing table size is now %d)",
+			logger.Infof("finished refreshing bucket %d to %s (routing table size is now %d)",
 				bucketId, target, dht.routingTable.Size())
 		}()
-		queryCtx, cancel := context.WithTimeout(ctx, dht.bootstrapCfg.Timeout)
+		queryCtx, cancel := context.WithTimeout(ctx, dht.rtRefreshQueryTimeout)
 		defer cancel()
 		err := f(queryCtx)
 		if err == context.DeadlineExceeded && queryCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
@@ -110,67 +97,58 @@ func (dht *IpfsDHT) bootstrapBuckets(ctx context.Context) error {
 	}
 
 	buckets := dht.routingTable.GetAllBuckets()
-	var wg sync.WaitGroup
-	errChan := make(chan error)
-
+	if len(buckets) > 16 {
+		// Don't bother bootstrapping more than 16 buckets.
+		// GenRandPeerID can't generate target peer IDs with more than
+		// 16 bits specified anyways.
+		buckets = buckets[:16]
+	}
 	for bucketID, bucket := range buckets {
-		if time.Since(bucket.RefreshedAt()) > dht.bootstrapCfg.BucketPeriod {
-			wg.Add(1)
-			go func(bucketID int, errChan chan<- error) {
-				defer wg.Done()
-				// gen rand peer in the bucket
-				randPeerInBucket := dht.routingTable.GenRandPeerID(bucketID)
-
-				// walk to the generated peer
-				walkFnc := func(c context.Context) error {
-					_, err := dht.FindPeer(ctx, randPeerInBucket)
-					if err == routing.ErrNotFound {
-						return nil
-					}
-					return err
-				}
-
-				if err := doQuery(bucketID, randPeerInBucket.String(), walkFnc); err != nil {
-					errChan <- errors.Wrapf(err, "failed to do a random walk on bucket %d", bucketID)
-				}
-			}(bucketID, errChan)
+		if time.Since(bucket.RefreshedAt()) <= dht.rtRefreshPeriod {
+			continue
 		}
-	}
+		// gen rand peer in the bucket
+		randPeerInBucket := dht.routingTable.GenRandPeerID(bucketID)
 
-	// wait for all walks to finish & close the error channel
-	go func() {
-		wg.Wait()
-		close(errChan)
-	}()
+		// walk to the generated peer
+		walkFnc := func(c context.Context) error {
+			_, err := dht.FindPeer(c, randPeerInBucket)
+			if err == routing.ErrNotFound {
+				return nil
+			}
+			return err
+		}
 
-	// accumulate errors from all go-routines. ensures wait group is completed by reading errChan until closure.
-	var errStrings []string
-	for err := range errChan {
-		errStrings = append(errStrings, err.Error())
-	}
-	if len(errStrings) == 0 {
-		return nil
-	} else {
-		return fmt.Errorf("errors encountered while running bootstrap on RT:\n%s", strings.Join(errStrings, "\n"))
+		if err := doQuery(bucketID, randPeerInBucket.String(), walkFnc); err != nil {
+			logger.Warningf("failed to do a random walk on bucket %d: %s", bucketID, err)
+		}
 	}
 }
 
 // Traverse the DHT toward the self ID
-func (dht *IpfsDHT) selfWalk(ctx context.Context) error {
-	queryCtx, cancel := context.WithTimeout(ctx, dht.bootstrapCfg.Timeout)
+func (dht *IpfsDHT) selfWalk(ctx context.Context) {
+	queryCtx, cancel := context.WithTimeout(ctx, dht.rtRefreshQueryTimeout)
 	defer cancel()
 	_, err := dht.FindPeer(queryCtx, dht.self)
 	if err == routing.ErrNotFound {
-		return nil
+		return
 	}
-	return err
+	logger.Warningf("failed to query self during routing table refresh: %s", err)
 }
 
-// synchronous bootstrap.
-func (dht *IpfsDHT) bootstrapOnce(ctx context.Context) error {
-	if err := dht.selfWalk(ctx); err != nil {
-		return errors.Wrap(err, "failed bootstrap while searching for self")
-	} else {
-		return dht.bootstrapBuckets(ctx)
+// Bootstrap tells the DHT to get into a bootstrapped state satisfying the
+// IpfsRouter interface.
+//
+// This just calls `RefreshRoutingTable`.
+func (dht *IpfsDHT) Bootstrap(_ context.Context) error {
+	dht.RefreshRoutingTable()
+	return nil
+}
+
+// RefreshRoutingTable tells the DHT to refresh it's routing tables.
+func (dht *IpfsDHT) RefreshRoutingTable() {
+	select {
+	case dht.triggerRtRefresh <- struct{}{}:
+	default:
 	}
 }

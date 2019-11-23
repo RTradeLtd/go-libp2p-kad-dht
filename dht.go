@@ -67,9 +67,12 @@ type IpfsDHT struct {
 
 	bucketSize int
 
-	bootstrapCfg opts.BootstrapConfig
+	autoRefresh           bool
+	rtRefreshQueryTimeout time.Duration
+	rtRefreshPeriod       time.Duration
+	triggerRtRefresh      chan struct{}
 
-	triggerBootstrap chan struct{}
+	maxRecordAge time.Duration
 }
 
 // Assert that IPFS assumptions about interfaces aren't broken. These aren't a
@@ -90,7 +93,11 @@ func New(ctx context.Context, h host.Host, options ...opts.Option) (*IpfsDHT, er
 		return nil, err
 	}
 	dht := makeDHT(ctx, h, cfg.Datastore, cfg.Protocols, cfg.BucketSize)
-	dht.bootstrapCfg = cfg.BootstrapConfig
+	dht.autoRefresh = cfg.RoutingTable.AutoRefresh
+	dht.rtRefreshPeriod = cfg.RoutingTable.RefreshPeriod
+	dht.rtRefreshQueryTimeout = cfg.RoutingTable.RefreshQueryTimeout
+
+	dht.maxRecordAge = cfg.MaxRecordAge
 
 	// register for network notifs.
 	dht.host.Network().Notify((*netNotifiee)(dht))
@@ -109,6 +116,7 @@ func New(ctx context.Context, h host.Host, options ...opts.Option) (*IpfsDHT, er
 			h.SetStreamHandler(p, dht.handleNewStream)
 		}
 	}
+	dht.startRefreshing()
 	return dht, nil
 }
 
@@ -159,7 +167,7 @@ func makeDHT(ctx context.Context, h host.Host, dstore ds.Batching, protocols []p
 		routingTable:     rt,
 		protocols:        protocols,
 		bucketSize:       bucketSize,
-		triggerBootstrap: make(chan struct{}),
+		triggerRtRefresh: make(chan struct{}),
 	}
 
 	dht.ctx = dht.newContextWithLocalTags(ctx)
@@ -174,7 +182,7 @@ func makeDHT(ctx context.Context, h host.Host, dstore ds.Batching, protocols []p
 	writeResp := func(errorChan chan error, err error) {
 		select {
 		case <-proc.Closing():
-		case errorChan <- err:
+		case errorChan <- errChan:
 		}
 		close(errorChan)
 	}

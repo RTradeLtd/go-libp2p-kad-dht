@@ -113,6 +113,7 @@ func setupDHT(ctx context.Context, t *testing.T, client bool) *IpfsDHT {
 		bhost.New(swarmt.GenSwarm(t, ctx, swarmt.OptDisableReuseport)),
 		opts.Client(client),
 		opts.NamespacedValidator("v", blankValidator{}),
+		opts.DisableAutoRefresh(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -190,7 +191,7 @@ func bootstrap(t *testing.T, ctx context.Context, dhts []*IpfsDHT) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	logger.Debugf("Bootstrapping DHTs...")
+	logger.Debugf("refreshing DHTs routing tables...")
 
 	// tried async. sequential fares much better. compare:
 	// 100 async https://gist.github.com/jbenet/56d12f0578d5f34810b2
@@ -200,7 +201,7 @@ func bootstrap(t *testing.T, ctx context.Context, dhts []*IpfsDHT) {
 	start := rand.Intn(len(dhts)) // randomize to decrease bias.
 	for i := range dhts {
 		dht := dhts[(start+i)%len(dhts)]
-		dht.bootstrapOnce(ctx)
+		dht.RefreshRoutingTable()
 	}
 }
 
@@ -638,7 +639,7 @@ func printRoutingTables(dhts []*IpfsDHT) {
 	}
 }
 
-func TestBootstrap(t *testing.T) {
+func TestRefresh(t *testing.T) {
 	if testing.Short() {
 		t.SkipNow()
 	}
@@ -688,9 +689,20 @@ func TestBootstrap(t *testing.T) {
 	}
 }
 
-func TestBootstrapBelowMinRTThreshold(t *testing.T) {
+func TestRefreshBelowMinRTThreshold(t *testing.T) {
 	ctx := context.Background()
-	dhtA := setupDHT(ctx, t, false)
+
+	// enable auto bootstrap on A
+	dhtA, err := New(
+		ctx,
+		bhost.New(swarmt.GenSwarm(t, ctx, swarmt.OptDisableReuseport)),
+		opts.Client(false),
+		opts.NamespacedValidator("v", blankValidator{}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	dhtB := setupDHT(ctx, t, false)
 	dhtC := setupDHT(ctx, t, false)
 
@@ -709,7 +721,7 @@ func TestBootstrapBelowMinRTThreshold(t *testing.T) {
 	connect(t, ctx, dhtB, dhtC)
 
 	// we ONLY init bootstrap on A
-	dhtA.Bootstrap(ctx)
+	dhtA.RefreshRoutingTable()
 	// and wait for one round to complete i.e. A should be connected to both B & C
 	waitForWellFormedTables(t, []*IpfsDHT{dhtA}, 2, 2, 20*time.Second)
 
@@ -737,7 +749,7 @@ func TestBootstrapBelowMinRTThreshold(t *testing.T) {
 	assert.Equal(t, dhtE.self, dhtA.routingTable.Find(dhtE.self), "A's routing table should have peer E!")
 }
 
-func TestPeriodicBootstrap(t *testing.T) {
+func TestPeriodicRefresh(t *testing.T) {
 	if ci.IsRunning() {
 		t.Skip("skipping on CI. highly timing dependent")
 	}
@@ -783,7 +795,7 @@ func TestPeriodicBootstrap(t *testing.T) {
 
 	t.Logf("bootstrapping them so they find each other. %d", nDHTs)
 	for _, dht := range dhts {
-		go dht.bootstrapOnce(ctx)
+		dht.RefreshRoutingTable()
 	}
 
 	// this is async, and we dont know when it's finished with one cycle, so keep checking
@@ -1416,6 +1428,7 @@ func TestGetSetPluggedProtocol(t *testing.T) {
 			opts.Protocols("/esh/dht"),
 			opts.Client(false),
 			opts.NamespacedValidator("v", blankValidator{}),
+			opts.DisableAutoRefresh(),
 		}
 
 		dhtA, err := New(ctx, bhost.New(swarmt.GenSwarm(t, ctx, swarmt.OptDisableReuseport)), os...)
@@ -1454,6 +1467,7 @@ func TestGetSetPluggedProtocol(t *testing.T) {
 			opts.Protocols("/esh/dht"),
 			opts.Client(false),
 			opts.NamespacedValidator("v", blankValidator{}),
+			opts.DisableAutoRefresh(),
 		}...)
 		if err != nil {
 			t.Fatal(err)
@@ -1463,6 +1477,7 @@ func TestGetSetPluggedProtocol(t *testing.T) {
 			opts.Protocols("/lsr/dht"),
 			opts.Client(false),
 			opts.NamespacedValidator("v", blankValidator{}),
+			opts.DisableAutoRefresh(),
 		}...)
 		if err != nil {
 			t.Fatal(err)
