@@ -28,14 +28,16 @@ import (
 	ds "github.com/ipfs/go-datastore"
 	logging "github.com/ipfs/go-log"
 	"github.com/jbenet/goprocess"
-	"github.com/jbenet/goprocess/context"
+	goprocessctx "github.com/jbenet/goprocess/context"
 	kb "github.com/libp2p/go-libp2p-kbucket"
-	"github.com/libp2p/go-libp2p-record"
+	record "github.com/libp2p/go-libp2p-record"
 	recpb "github.com/libp2p/go-libp2p-record/pb"
 	"github.com/multiformats/go-base32"
 )
 
 var logger = logging.Logger("dht")
+
+const BaseConnMgrScore = 5
 
 // IpfsDHT is an implementation of Kademlia with S/Kademlia modifications.
 // It is used to implement the base Routing module.
@@ -73,6 +75,11 @@ type IpfsDHT struct {
 	triggerRtRefresh      chan chan<- error
 
 	maxRecordAge time.Duration
+
+	// Allows disabling dht subsystems. These should _only_ be set on
+	// "forked" DHTs (e.g., DHTs with custom protocols and/or private
+	// networks).
+	enableProviders, enableValues bool
 }
 
 // Assert that IPFS assumptions about interfaces aren't broken. These aren't a
@@ -98,6 +105,8 @@ func New(ctx context.Context, h host.Host, options ...opts.Option) (*IpfsDHT, er
 	dht.rtRefreshQueryTimeout = cfg.RoutingTable.RefreshQueryTimeout
 
 	dht.maxRecordAge = cfg.MaxRecordAge
+	dht.enableProviders = cfg.EnableProviders
+	dht.enableValues = cfg.EnableValues
 
 	// register for network notifs.
 	dht.host.Network().Notify((*netNotifiee)(dht))
@@ -144,11 +153,13 @@ func NewDHTClient(ctx context.Context, h host.Host, dstore ds.Batching) *IpfsDHT
 }
 
 func makeDHT(ctx context.Context, h host.Host, dstore ds.Batching, protocols []protocol.ID, bucketSize int) *IpfsDHT {
-	rt := kb.NewRoutingTable(bucketSize, kb.ConvertPeerID(h.ID()), time.Minute, h.Peerstore())
+	self := kb.ConvertPeerID(h.ID())
+	rt := kb.NewRoutingTable(bucketSize, self, time.Minute, h.Peerstore())
 	cmgr := h.ConnManager()
 
 	rt.PeerAdded = func(p peer.ID) {
-		cmgr.TagPeer(p, "kbucket", 5)
+		commonPrefixLen := kb.CommonPrefixLen(self, kb.ConvertPeerID(p))
+		cmgr.TagPeer(p, "kbucket", BaseConnMgrScore+commonPrefixLen)
 	}
 
 	rt.PeerRemoved = func(p peer.ID) {

@@ -107,13 +107,15 @@ func (testAtomicPutValidator) Select(_ string, bs [][]byte) (int, error) {
 	return index, nil
 }
 
-func setupDHT(ctx context.Context, t *testing.T, client bool) *IpfsDHT {
+func setupDHT(ctx context.Context, t *testing.T, client bool, options ...opts.Option) *IpfsDHT {
 	d, err := New(
 		ctx,
 		bhost.New(swarmt.GenSwarm(t, ctx, swarmt.OptDisableReuseport)),
-		opts.Client(client),
-		opts.NamespacedValidator("v", blankValidator{}),
-		opts.DisableAutoRefresh(),
+		append([]opts.Option{
+			opts.Client(client),
+			opts.NamespacedValidator("v", blankValidator{}),
+			opts.DisableAutoRefresh(),
+		}, options...)...,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -755,6 +757,79 @@ func TestRefreshBelowMinRTThreshold(t *testing.T) {
 	// and because of the above bootstrap, A also discovers E !
 	waitForWellFormedTables(t, []*IpfsDHT{dhtA}, 4, 4, 20*time.Second)
 	assert.Equal(t, dhtE.self, dhtA.routingTable.Find(dhtE.self), "A's routing table should have peer E!")
+}
+
+// Check to make sure we re-fill the routing table from connected peers when it
+// completely empties.
+func TestEmptyTable(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	nDHTs := 50 // needs more than 40 peers so we don't add all of them to our routing table.
+	dhts := setupDHTS(t, ctx, nDHTs)
+	defer func() {
+		for _, dht := range dhts {
+			dht.Close()
+			defer dht.host.Close()
+		}
+	}()
+
+	t.Logf("dhts are not connected. %d", nDHTs)
+	for _, dht := range dhts {
+		rtlen := dht.routingTable.Size()
+		if rtlen > 0 {
+			t.Errorf("routing table for %s should have 0 peers. has %d", dht.self, rtlen)
+		}
+	}
+
+	for i := 1; i < nDHTs; i++ {
+		connectNoSync(t, ctx, dhts[0], dhts[i])
+	}
+
+	// Wait till the routing table stabilizes.
+	oldSize := dhts[0].routingTable.Size()
+	for {
+		time.Sleep(time.Millisecond)
+		newSize := dhts[0].routingTable.Size()
+		if oldSize == newSize {
+			break
+		}
+		oldSize = newSize
+	}
+
+	if u.Debug {
+		printRoutingTables(dhts[:1])
+	}
+
+	// Disconnect from all peers that _were_ in the routing table.
+	routingTablePeers := make(map[peer.ID]bool, nDHTs)
+	for _, p := range dhts[0].RoutingTable().ListPeers() {
+		routingTablePeers[p] = true
+	}
+
+	oldDHTs := dhts[1:]
+	dhts = dhts[:1]
+	for _, dht := range oldDHTs {
+		if routingTablePeers[dht.Host().ID()] {
+			dhts[0].Host().Network().ClosePeer(dht.host.ID())
+			dht.Close()
+			dht.host.Close()
+		} else {
+			dhts = append(dhts, dht)
+		}
+	}
+
+	// we should now _re-add_ some peers to the routing table
+	for i := 0; i < 100; i++ {
+		if dhts[0].routingTable.Size() > 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if u.Debug {
+		printRoutingTables(dhts[:1])
+	}
+	t.Fatal("routing table shouldn't have been empty")
 }
 
 func TestPeriodicRefresh(t *testing.T) {
@@ -1424,6 +1499,72 @@ func TestFindClosestPeers(t *testing.T) {
 
 	if len(out) != KValue {
 		t.Fatalf("got wrong number of peers (got %d, expected %d)", len(out), KValue)
+	}
+}
+
+func TestProvideDisabled(t *testing.T) {
+	k := testCaseCids[0]
+	for i := 0; i < 3; i++ {
+		enabledA := (i & 0x1) > 0
+		enabledB := (i & 0x2) > 0
+		t.Run(fmt.Sprintf("a=%v/b=%v", enabledA, enabledB), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var (
+				optsA, optsB []opts.Option
+			)
+			if !enabledA {
+				optsA = append(optsA, opts.DisableProviders())
+			}
+			if !enabledB {
+				optsB = append(optsB, opts.DisableProviders())
+			}
+
+			dhtA := setupDHT(ctx, t, false, optsA...)
+			dhtB := setupDHT(ctx, t, false, optsB...)
+
+			defer dhtA.Close()
+			defer dhtB.Close()
+			defer dhtA.host.Close()
+			defer dhtB.host.Close()
+
+			connect(t, ctx, dhtA, dhtB)
+
+			err := dhtB.Provide(ctx, k, true)
+			if enabledB {
+				if err != nil {
+					t.Fatal("put should have succeeded on node B", err)
+				}
+			} else {
+				if err != routing.ErrNotSupported {
+					t.Fatal("should not have put the value to node B", err)
+				}
+				_, err = dhtB.FindProviders(ctx, k)
+				if err != routing.ErrNotSupported {
+					t.Fatal("get should have failed on node B")
+				}
+				provs := dhtB.providers.GetProviders(ctx, k)
+				if len(provs) != 0 {
+					t.Fatal("node B should not have found local providers")
+				}
+			}
+
+			provs, err := dhtA.FindProviders(ctx, k)
+			if enabledA {
+				if len(provs) != 0 {
+					t.Fatal("node A should not have found providers")
+				}
+			} else {
+				if err != routing.ErrNotSupported {
+					t.Fatal("node A should not have found providers")
+				}
+			}
+			provAddrs := dhtA.providers.GetProviders(ctx, k)
+			if len(provAddrs) != 0 {
+				t.Fatal("node A should not have found local providers")
+			}
+		})
 	}
 }
 
