@@ -19,8 +19,6 @@ import (
 	"github.com/multiformats/go-multihash"
 	"github.com/multiformats/go-multistream"
 
-	"golang.org/x/xerrors"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -30,7 +28,7 @@ import (
 	"github.com/ipfs/go-cid"
 	u "github.com/ipfs/go-ipfs-util"
 	kb "github.com/libp2p/go-libp2p-kbucket"
-	"github.com/libp2p/go-libp2p-record"
+	record "github.com/libp2p/go-libp2p-record"
 	swarmt "github.com/libp2p/go-libp2p-swarm/testing"
 	"github.com/libp2p/go-libp2p-testing/ci"
 	travisci "github.com/libp2p/go-libp2p-testing/ci/travis"
@@ -402,6 +400,30 @@ func TestValueSetInvalid(t *testing.T) {
 	testSetGet("valid", true, "newer", nil)
 }
 
+func TestContextShutDown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dht := setupDHT(ctx, t, false)
+
+	// context is alive
+	select {
+	case <-dht.Context().Done():
+		t.Fatal("context should not be done")
+	default:
+	}
+
+	// shut down dht
+	require.NoError(t, dht.Close())
+
+	// now context should be done
+	select {
+	case <-dht.Context().Done():
+	default:
+		t.Fatal("context should be done")
+	}
+}
+
 func TestSearchValue(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -653,7 +675,7 @@ func TestLocalProvides(t *testing.T) {
 
 	for _, c := range testCaseCids {
 		for i := 0; i < 3; i++ {
-			provs := dhts[i].providers.GetProviders(ctx, c.Hash())
+			provs := dhts[i].ProviderManager.GetProviders(ctx, c.Hash())
 			if len(provs) > 0 {
 				t.Fatal("shouldnt know this")
 			}
@@ -1394,7 +1416,7 @@ func TestClientModeConnect(t *testing.T) {
 
 	c := testCaseCids[0]
 	p := peer.ID("TestPeer")
-	a.providers.AddProvider(ctx, c.Hash(), p)
+	a.ProviderManager.AddProvider(ctx, c.Hash(), p)
 	time.Sleep(time.Millisecond * 5) // just in case...
 
 	provs, err := b.FindProviders(ctx, c)
@@ -1609,7 +1631,7 @@ func TestProvideDisabled(t *testing.T) {
 				if err != routing.ErrNotSupported {
 					t.Fatal("get should have failed on node B")
 				}
-				provs := dhtB.providers.GetProviders(ctx, kHash)
+				provs := dhtB.ProviderManager.GetProviders(ctx, kHash)
 				if len(provs) != 0 {
 					t.Fatal("node B should not have found local providers")
 				}
@@ -1625,7 +1647,7 @@ func TestProvideDisabled(t *testing.T) {
 					t.Fatal("node A should not have found providers")
 				}
 			}
-			provAddrs := dhtA.providers.GetProviders(ctx, kHash)
+			provAddrs := dhtA.ProviderManager.GetProviders(ctx, kHash)
 			if len(provAddrs) != 0 {
 				t.Fatal("node A should not have found local providers")
 			}
@@ -1731,5 +1753,5 @@ func TestClientModeAtInit(t *testing.T) {
 	client := setupDHT(ctx, t, true)
 	pinger.Host().Peerstore().AddAddrs(client.PeerID(), client.Host().Addrs(), peerstore.AddressTTL)
 	err := pinger.Ping(context.Background(), client.PeerID())
-	assert.True(t, xerrors.Is(err, multistream.ErrNotSupported))
+	assert.True(t, errors.Is(err, multistream.ErrNotSupported))
 }
