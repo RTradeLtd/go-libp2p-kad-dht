@@ -2,11 +2,11 @@ package dht
 
 import (
 	"fmt"
-	"github.com/ipfs/go-ipns"
 	"time"
 
 	ds "github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
+	"github.com/ipfs/go-ipns"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
@@ -25,8 +25,11 @@ const (
 	ModeClient
 	// ModeServer operates the DHT as a server, it can both send and respond to queries
 	ModeServer
+	// ModeAutoServer operates in the same way as ModeAuto, but acts as a server when reachability is unknown
+	ModeAutoServer
 )
 
+// DefaultPrefix is the application specific prefix attached to all DHT protocols by default.
 const DefaultPrefix protocol.ID = "/ipfs"
 
 // Options is a structure containing all the options that can be used when constructing a DHT.
@@ -255,6 +258,15 @@ func ProtocolPrefix(prefix protocol.ID) Option {
 	}
 }
 
+// ProtocolExtension adds an application specific protocol to the DHT protocol. For example,
+// /ipfs/lan/kad/1.0.0 instead of /ipfs/kad/1.0.0. extension should be of the form /lan.
+func ProtocolExtension(ext protocol.ID) Option {
+	return func(c *config) error {
+		c.protocolPrefix += ext
+		return nil
+	}
+}
+
 // BucketSize configures the bucket size (k in the Kademlia paper) of the routing table.
 //
 // The default value is 20.
@@ -322,7 +334,7 @@ func DisableProviders() Option {
 	}
 }
 
-// DisableProviders disables storing and retrieving value records (including
+// DisableValues disables storing and retrieving value records (including
 // public keys).
 //
 // Defaults to enabled.

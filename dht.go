@@ -36,6 +36,8 @@ import (
 
 var logger = logging.Logger("dht")
 
+// BaseConnMgrScore is the base of the score set on the connection manager "kbucket" tag.
+// It is added with the common prefix length between two peer IDs.
 const BaseConnMgrScore = 5
 
 type mode int
@@ -84,7 +86,7 @@ type IpfsDHT struct {
 	// DHT protocols we can respond to.
 	serverProtocols []protocol.ID
 
-	auto   bool
+	auto   ModeOpt
 	mode   mode
 	modeLk sync.Mutex
 
@@ -108,10 +110,10 @@ type IpfsDHT struct {
 	// networks).
 	enableProviders, enableValues bool
 
-	// maxLastSuccessfulOutboundThreshold is the max threshold/upper limit for the value of "lastSuccessfulOutboundQuery"
-	// of the peer in the bucket above which we will evict it to make place for a new peer if the bucket
-	// is full
-	maxLastSuccessfulOutboundThreshold time.Duration
+	// successfulOutboundQueryGracePeriod is the maximum grace period we will give to a peer
+	// to between two successful query responses from it, failing which,
+	// we will ping it to see if it's alive.
+	successfulOutboundQueryGracePeriod time.Duration
 
 	fixLowPeersChan chan struct{}
 }
@@ -157,15 +159,11 @@ func New(ctx context.Context, h host.Host, options ...Option) (*IpfsDHT, error) 
 
 	dht.Validator = cfg.validator
 
+	dht.auto = cfg.mode
 	switch cfg.mode {
-	case ModeAuto:
-		dht.auto = true
+	case ModeAuto, ModeClient:
 		dht.mode = modeClient
-	case ModeClient:
-		dht.auto = false
-		dht.mode = modeClient
-	case ModeServer:
-		dht.auto = false
+	case ModeAutoServer, ModeServer:
 		dht.mode = modeServer
 	default:
 		return nil, fmt.Errorf("invalid dht mode %d", cfg.mode)
@@ -289,11 +287,12 @@ func makeRoutingTable(dht *IpfsDHT, cfg config) (*kb.RoutingTable, error) {
 	// be published soon.
 	l1 := math.Log(float64(1) / float64(defaultBucketSize))                              //(Log(1/K))
 	l2 := math.Log(float64(1) - (float64(cfg.concurrency) / float64(defaultBucketSize))) // Log(1 - (alpha / K))
-	maxLastSuccessfulOutboundThreshold := l1 / l2 * float64(cfg.routingTable.refreshInterval)
+	maxLastSuccessfulOutboundThreshold := time.Duration(l1 / l2 * float64(cfg.routingTable.refreshInterval))
 
 	self := kb.ConvertPeerID(dht.host.ID())
 
 	rt, err := kb.NewRoutingTable(cfg.bucketSize, self, time.Minute, dht.host.Peerstore(), maxLastSuccessfulOutboundThreshold)
+	dht.successfulOutboundQueryGracePeriod = maxLastSuccessfulOutboundThreshold
 	cmgr := dht.host.ConnManager()
 
 	rt.PeerAdded = func(p peer.ID) {
@@ -308,6 +307,11 @@ func makeRoutingTable(dht *IpfsDHT, cfg config) (*kb.RoutingTable, error) {
 	}
 
 	return rt, err
+}
+
+// Mode allows introspection of the operation mode of the DHT
+func (dht *IpfsDHT) Mode() ModeOpt {
+	return dht.auto
 }
 
 // fixLowPeers tries to get more peers into the routing table if we're below the threshold
@@ -448,22 +452,37 @@ func (dht *IpfsDHT) putLocal(key string, rec *recpb.Record) error {
 
 // peerFound signals the routingTable that we've found a peer that
 // might support the DHT protocol.
+// If we have a connection a peer but no exchange of a query RPC ->
+//    LastQueriedAt=time.Now (so we don't ping it for some time for a liveliness check)
+//    LastUsefulAt=N/A
+// If we connect to a peer and exchange a query RPC ->
+//    LastQueriedAt=time.Now (same reason as above)
+//    LastUsefulAt=time.Now (so we give it some life in the RT without immediately evicting it)
+// If we query a peer we already have in our Routing Table ->
+//    LastQueriedAt=time.Now()
+//    LastUsefulAt remains unchanged
+// If we connect to a peer we already have in the RT but do not exchange a query (rare)
+//    Do Nothing.
 func (dht *IpfsDHT) peerFound(ctx context.Context, p peer.ID, queryPeer bool) {
 	logger.Debugw("peer found", "peer", p)
 	b, err := dht.validRTPeer(p)
 	if err != nil {
 		logger.Errorw("failed to validate if peer is a DHT peer", "peer", p, "error", err)
 	} else if b {
-		_, err := dht.routingTable.TryAddPeer(p, queryPeer)
+		newlyAdded, err := dht.routingTable.TryAddPeer(p, queryPeer)
 		if err != nil {
 			// peer not added.
 			return
 		}
 
-		// If we discovered the peer because of a query, we need to ensure we override the "zero" lastSuccessfulOutboundQuery
+		// If we freshly added the peer because of a query, we need to ensure we override the "zero" lastUsefulAt
 		// value that must have been set in the Routing Table for this peer when it was first added during a connection.
-		if queryPeer {
-			dht.routingTable.UpdateLastSuccessfulOutboundQuery(p, time.Now())
+		if newlyAdded && queryPeer {
+			dht.routingTable.UpdateLastUsefulAt(p, time.Now())
+		} else if queryPeer {
+			// the peer is already in our RT, but we just successfully queried it and so let's give it a
+			// bump on the query time so we don't ping it too soon for a liveliness check.
+			dht.routingTable.UpdateLastSuccessfulOutboundQueryAt(p, time.Now())
 		}
 	}
 }
@@ -606,22 +625,22 @@ func (dht *IpfsDHT) getMode() mode {
 	return dht.mode
 }
 
-// Context return dht's context
+// Context returns the DHT's context.
 func (dht *IpfsDHT) Context() context.Context {
 	return dht.ctx
 }
 
-// Process return dht's process
+// Process returns the DHT's process.
 func (dht *IpfsDHT) Process() goprocess.Process {
 	return dht.proc
 }
 
-// RoutingTable return dht's routingTable
+// RoutingTable returns the DHT's routingTable.
 func (dht *IpfsDHT) RoutingTable() *kb.RoutingTable {
 	return dht.routingTable
 }
 
-// Close calls Process Close
+// Close calls Process Close.
 func (dht *IpfsDHT) Close() error {
 	return dht.proc.Close()
 }
@@ -630,18 +649,22 @@ func mkDsKey(s string) ds.Key {
 	return ds.NewKey(base32.RawStdEncoding.EncodeToString([]byte(s)))
 }
 
+// PeerID returns the DHT node's Peer ID.
 func (dht *IpfsDHT) PeerID() peer.ID {
 	return dht.self
 }
 
+// PeerKey returns a DHT key, converted from the DHT node's Peer ID.
 func (dht *IpfsDHT) PeerKey() []byte {
 	return kb.ConvertPeerID(dht.self)
 }
 
+// Host returns the libp2p host this DHT is operating with.
 func (dht *IpfsDHT) Host() host.Host {
 	return dht.host
 }
 
+// Ping sends a ping message to the passed peer and waits for a response.
 func (dht *IpfsDHT) Ping(ctx context.Context, p peer.ID) error {
 	req := pb.NewMessage(pb.Message_PING, nil, 0)
 	resp, err := dht.sendRequest(ctx, p, req)

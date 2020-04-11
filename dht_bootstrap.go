@@ -3,17 +3,17 @@ package dht
 import (
 	"context"
 	"fmt"
-	"github.com/libp2p/go-libp2p-core/peer"
 	"time"
 
 	multierror "github.com/hashicorp/go-multierror"
 	process "github.com/jbenet/goprocess"
 	processctx "github.com/jbenet/goprocess/context"
+	"github.com/libp2p/go-libp2p-core/peer"
 	kbucket "github.com/libp2p/go-libp2p-kbucket"
 	"github.com/multiformats/go-multiaddr"
-	_ "github.com/multiformats/go-multiaddr-dns"
 )
 
+// DefaultBootstrapPeers is a set of public DHT bootstrap peers provided by libp2p.
 var DefaultBootstrapPeers []multiaddr.Multiaddr
 
 // Minimum number of peers in the routing table. If we drop below this and we
@@ -128,7 +128,7 @@ func (dht *IpfsDHT) startRefreshing() {
 			// ping Routing Table peers that haven't been hear of/from in the interval they should have been.
 			for _, ps := range dht.routingTable.GetPeerInfos() {
 				// ping the peer if it's due for a ping and evict it if the ping fails
-				if time.Since(ps.LastSuccessfulOutboundQuery) > dht.maxLastSuccessfulOutboundThreshold {
+				if time.Since(ps.LastSuccessfulOutboundQueryAt) > dht.successfulOutboundQueryGracePeriod {
 					livelinessCtx, cancel := context.WithTimeout(ctx, peerPingTimeout)
 					if err := dht.host.Connect(livelinessCtx, peer.AddrInfo{ID: ps.Id}); err != nil {
 						logger.Debugw("evicting peer after failed ping", "peer", ps.Id, "error", err)
